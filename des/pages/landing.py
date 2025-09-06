@@ -4,11 +4,11 @@ import pandas as pd
 
 
 class AppState(rx.State):
-    M: str = "133457799BBCDFF0"
-    K: str = "A0B1C2D3E4F56789"
-    cipher_hex: str = ""
+    msg: str = "133457799BBCDFF0"
+    key: str = "A0B1C2D3E4F56789"
     process: str = "en"
     error: bool = False
+    error_msg: str = ""
 
     valid_process: list[str] = ["en", "de"]
 
@@ -148,7 +148,6 @@ class AppState(rx.State):
         length = len(a)
         return format(int(a, 2) ^ int(b, 2), f'0{length}b')
 
-    # DES
     def sbox_substitution(self, bits48: str) -> str:
         out = []
         for i in range(8):
@@ -169,57 +168,76 @@ class AppState(rx.State):
         # P-permutation
         return self.permute(sboxed, self.P)
 
+    # DES
     @rx.var
-    def cipher(self) -> str:
-        df = pd.DataFrame(self.des_encrypt.get("result", [])) if self.process == "en" else pd.DataFrame(self.des_decrypt.get("result", []))
-        if not df.empty:
-            return str(df.iloc[0, 0])
-        return "N/A"
-    
+    def get_des_result(self) -> dict[str, str]:
+        """Return encrypted/decrypted result of the message"""
+        result = self.des_encrypt.get("result", pd.DataFrame({}))
+        if result.empty:
+            return {}
+        return {
+            "cipher": result['cipher'].loc[0],
+            "decrypted_cipher": result['decrypted_cipher'].loc[0],
+        }
+
+    @rx.var
+    def get_round_outputs(self) -> dict[str, str]:
+        """ Return keys after 2 rounds"""
+        outputs = self.des_encrypt.get("round_outputs", pd.DataFrame({}))
+        if outputs.empty:
+            return {}
+        return {
+            "L2": outputs["L2"].loc[0],
+            "R2": outputs["R2"].loc[0],
+        }
+
     # Encrypt
     @rx.var
     def des_encrypt(self) -> Dict[str, pd.DataFrame]:
-        if not self.M or not self.K:
-            # Empty dataframe
-            return {
-                "result": pd.DataFrame({
-                    "result": []
-                }),
-                "subkeys": pd.DataFrame({
-                    "i": [],
-                    "key_i": []
-                }),
-                "permutation": pd.DataFrame({
-                    "i": [],
-                    "key_left": [],
-                    "key_right": [],
-                })
-            }
+        try:
+            if not self.msg or not self.key:
+                # Empty dataframe
+                return {}
 
-        msg_bin = self.hex_to_bin(self.M, 64)
-        msg_ip = self.permute(msg_bin, self.IP)
+            msg_bin = self.hex_to_bin(self.msg, 64)
+            msg_ip = self.permute(msg_bin, self.IP)
+            L, R = msg_ip[:32], msg_ip[32:]
 
-        L, R = msg_ip[:32], msg_ip[32:]
-        subkeys, C_list, D_list = self.generate_keys(self.K)
-        L_list = [L]
-        R_list = [R]
-        for i in range(16):
-            f_out = self.f_function(R, subkeys[i])
-            newL = R
-            newR = self.xor_bits(L, f_out)
-            L, R = newL, newR
-            L_list.append(L)
-            R_list.append(R)
+            round_outputs: list[tuple[str]] = []
 
-        # After 16 rounds, swap L and R and apply final permutation
-        pre_output = R + L
-        cipher_bin = self.permute(pre_output, self.FP)
+            subkeys, C_list, D_list = self.generate_keys(self.key)
+            L_list = [L]
+            R_list = [R]
+            for i in range(16):
+                f_out = self.f_function(R, subkeys[i])
+                newL = R
+                newR = self.xor_bits(L, f_out)
+                L, R = newL, newR
+                L_list.append(L)
+                R_list.append(R)
+                if i == 1:
+                    round_outputs.append(
+                        (self.bin_to_hex(L), self.bin_to_hex(R)))
 
-        cipher_hex: str = self.bin_to_hex(cipher_bin)
+            # After 16 rounds, swap L and R and apply final permutation
+            pre_output = R + L
+            cipher_bin = self.permute(pre_output, self.FP)
+            cipher_hex: str = self.bin_to_hex(cipher_bin)
+
+            # Decrypted result
+            decrypted_cipher = self.des_decrypt(C=cipher_hex)
+
+            # No error commit
+            self.error_raise(False)
+
+        except (Exception) as e:
+            self.error_raise(True, msg="Invalid value for hex-message")
+            return {}
 
         return {
             "result": pd.DataFrame({
-                "result": [cipher_hex]
+                "cipher": [cipher_hex],
+                "decrypted_cipher": [decrypted_cipher]
             }),
             "subkeys": pd.DataFrame({
                 "i": range(len(subkeys)),
@@ -229,86 +247,56 @@ class AppState(rx.State):
                 "i": range(len(L_list)),
                 "key_left": [self.bin_to_hex(key_l) for key_l in L_list],
                 "key_right": [self.bin_to_hex(key_r) for key_r in R_list],
+            }),
+            "round_outputs": pd.DataFrame({
+                "L2": [round_outputs[0][0]],
+                "R2": [round_outputs[0][1]]
             })
         }
 
     # Decrypt
-    @rx.var
-    def des_decrypt(self) -> Dict[str, pd.DataFrame]:
-        if not self.M or not self.K:
-            # Empty dataframe
-            return {
-                "result": pd.DataFrame({
-                    "result": []
-                }),
-                "subkeys": pd.DataFrame({
-                    "i": [],
-                    "key_i": []
-                }),
-                "permutation": pd.DataFrame({
-                    "i": [],
-                    "key_left": [],
-                    "key_right": [],
-                })
-            }
-        cipher_bin = self.hex_to_bin(self.M, 64)
+    def des_decrypt(self, C: str) -> str:
+        cipher_bin = self.hex_to_bin(C, 64)
         cipher_ip = self.permute(cipher_bin, self.IP)
         L, R = cipher_ip[:32], cipher_ip[32:]
 
-        subkeys, C_list, D_list = self.generate_keys(self.K)
+        subkeys, C_list, D_list = self.generate_keys(self.key)
         subkeys_rev = subkeys[::-1]
-
-        L_list = [L]
-        R_list = [R]
 
         for i in range(16):
             f_out = self.f_function(R, subkeys_rev[i])
             newL = R
             newR = self.xor_bits(L, f_out)
             L, R = newL, newR
-            L_list.append(L)
-            R_list.append(R)
 
         pre_output = R + L
-        msg_bin = self.permute(pre_output, self.FP)
-        cipher_hex = self.bin_to_hex(msg_bin)
+        decrypted_cipher_bin = self.permute(pre_output, self.FP)
+        decrypted_cipher = self.bin_to_hex(decrypted_cipher_bin)
 
-        return {
-            "result": pd.DataFrame({
-                "result": list(cipher_hex)
-            }),
-            "subkeys": pd.DataFrame({
-                "i": range(len(subkeys_rev)),
-                "key_i": [self.bin_to_hex(key) for key in subkeys],
-            }),
-            "permutation": pd.DataFrame({
-                "i": range(len(L_list)),
-                "key_left": [self.bin_to_hex(key_l) for key_l in L_list],
-                "key_right": [self.bin_to_hex(key_r) for key_r in R_list],
-            })
-        }
+        return decrypted_cipher
 
     @rx.event
-    def error_raise(self, value: bool):
+    def error_raise(self, value: bool, msg: str=""):
         self.error = value
+        self.error_msg = msg
 
     @rx.event
-    def set_cipher(self, value: str):
+    def set_msg(self, value: str):
         if not value.isalnum() and value != "":
-            self.error_raise(True)
+            self.error_raise(True, "Invalid value, K and M should contains only alpha-numeric character")
             return
         else:
             self.error_raise(False)
-            self.M = value
+            self.msg = value
 
     @rx.event
     def set_key(self, value: str):
         if not value.isalnum() and value != "":
-            self.error_raise(True)
+            self.error_raise(True, "Invalid value, K and M should contains only alpha-numeric character")
             return
         else:
             self.error_raise(False)
-            self.K = value
+            self.key = value
 
     @rx.event
     def set_process(self, value: str):
@@ -322,19 +310,19 @@ def index() -> rx.Component:
             # Input M
             rx.input(
                 placeholder="Input M here...",
-                default_value=AppState.M,
-                on_change=AppState.set_cipher,
+                default_value=AppState.msg,
+                on_change=AppState.set_msg,
             ),
             # Input key
             rx.input(
                 placeholder="Input Key here...",
-                default_value=AppState.K,
+                default_value=AppState.key,
                 on_change=AppState.set_key,
             ),
             rx.text(
                 rx.cond(
                     AppState.error,
-                    "Invalid value, K and M should contains only alpha-numeric character",
+                    AppState.error_msg,
                     ""
                 ),
                 color=rx.color('red', 9)
@@ -347,11 +335,20 @@ def index() -> rx.Component:
                 default_value="en",
                 on_change=AppState.set_process
             ),
-            rx.text(
-                f"""
-                Result: {AppState.cipher}
-                """
+            rx.vstack(
+                # Cipher
+                rx.text(
+                    rx.cond(
+                        AppState.process == "en",
+                        f"Result: {AppState.get_des_result.get('cipher', "N/A")}",
+                        f"Result: {AppState.get_des_result.get('decrypted_cipher', "N/A")}"
+                    ),
+                ),
+                # Result after 2 rounds
+                rx.text(f"L2: {AppState.get_round_outputs.get("L2", "N/A")}"),
+                rx.text(f"R2: {AppState.get_round_outputs.get("R2", "N/A")}"),
             ),
+
             direction="column",
             spacing="3",
             width="30%"
@@ -359,20 +356,12 @@ def index() -> rx.Component:
         # Display
         rx.flex(
             rx.data_table(
-                data=rx.cond(
-                    AppState.process == "en",
-                    AppState.des_encrypt.get("subkeys", pd.DataFrame({})),
-                    AppState.des_decrypt.get("subkeys", pd.DataFrame({})),
-                ),
+                data=AppState.des_encrypt.get("subkeys", pd.DataFrame({})),
                 pagination=True,
                 sort=False
             ),
             rx.data_table(
-                data=rx.cond(
-                    AppState.process == "en",
-                    AppState.des_encrypt.get("permutation", pd.DataFrame({})),
-                    AppState.des_decrypt.get("permutation", pd.DataFrame({})),
-                ),
+                data=AppState.des_encrypt.get("permutation", pd.DataFrame({})),
                 pagination=True,
                 sort=False,
             ),
